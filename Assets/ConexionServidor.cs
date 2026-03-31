@@ -2,27 +2,34 @@ using UnityEngine;
 using UnityEngine.Networking;
 using System.Collections;
 
+/// <summary>
+/// ConexionServidor.cs — VERSIÓN ACTUALIZADA
+///
+/// Cambios respecto al original:
+///   - Ahora mueve los caballos NPC usando HorseNPC.SetTargetSpeed() y
+///     SetLateralPosition() en lugar de moverlos directamente con transform.
+///   - El caballo del jugador NO se mueve desde aquí (lo controla HorseRacer).
+///   - Se agregó soporte para múltiples caballos NPC con un arreglo.
+///
+/// INSTRUCCIONES DE USO:
+///   1. Reemplaza tu ConexionServidor.cs existente con este archivo.
+///   2. En el Inspector, arrastra cada GameObject de caballo NPC
+///      al arreglo "Caballos NPC".
+///   3. El orden del arreglo debe coincidir con los IDs del servidor Python
+///      (índice 0 = caballo ID 1 del servidor, etc. — ajusta según tu lógica).
+/// </summary>
 public class ConexionServidor : MonoBehaviour
 {
-    [Header("Configuración")]
+    [Header("Configuración del servidor")]
     public string urlServidor = "http://127.0.0.1:5000/tick";
-    public float tiempoDeActualizacion = 0.2f; // 5 veces por segundo, igual que en tu web
+    public float tiempoDeActualizacion = 0.2f;
 
-    [Header("Caballos en Unity")]
-    // Aquí arrastraremos a tu modelo de caballo desde la jerarquía de Unity
-    public GameObject caballoRelampago; 
-
-    private Animator animRelampago;
+    [Header("Caballos NPC (en orden de ID del servidor)")]
+    [Tooltip("Arrastra aquí los GameObjects de los caballos NPC (NO el del jugador)")]
+    public HorseNPC[] caballosNPC;
 
     void Start()
     {
-        // Obtenemos el cerebro de animación del caballo
-        if (caballoRelampago != null)
-        {
-            animRelampago = caballoRelampago.GetComponentInChildren<Animator>();
-        }
-
-        // Iniciamos el ciclo infinito de preguntarle a Python
         StartCoroutine(PedirDatosContinuamente());
     }
 
@@ -30,72 +37,61 @@ public class ConexionServidor : MonoBehaviour
     {
         while (true)
         {
-            // Hacemos la petición a Python
             UnityWebRequest www = UnityWebRequest.Get(urlServidor);
             yield return www.SendWebRequest();
 
-            if (www.result == UnityWebRequest.Result.ConnectionError || www.result == UnityWebRequest.Result.ProtocolError)
+            if (www.result == UnityWebRequest.Result.ConnectionError ||
+                www.result == UnityWebRequest.Result.ProtocolError)
             {
-                Debug.Log("Error conectando a Python: " + www.error);
-                Debug.Log("¿Asegúrate de que app.py esté corriendo en tu terminal!");
+                Debug.LogWarning("[ConexionServidor] No se pudo conectar a Python: " + www.error);
             }
             else
             {
-                // Si Python responde, leemos el texto (JSON)
-                string jsonRespuesta = www.downloadHandler.text;
-                ProcesarDatosDePython(jsonRespuesta);
+                ProcesarDatosDePython(www.downloadHandler.text);
             }
 
-            // Esperamos 0.2 segundos antes de volver a preguntar
             yield return new WaitForSeconds(tiempoDeActualizacion);
         }
     }
 
     void ProcesarDatosDePython(string json)
     {
-        // Convertimos el texto JSON a variables de C# usando la clase que definimos abajo
         DatosDelServidor datos = JsonUtility.FromJson<DatosDelServidor>(json);
+        if (datos == null || datos.caballos == null) return;
 
-        if (datos != null && datos.caballos != null)
+        foreach (CaballoPython cp in datos.caballos)
         {
-            foreach (CaballoPython cp in datos.caballos)
+            // El ID 1 es el jugador — lo saltamos, lo controla HorseRacer
+            // Ajusta esta condición según cómo identifiques al jugador en tu servidor
+            if (cp.id == 1) continue;
+
+            // Los NPC van del ID 2 en adelante → índice en el arreglo = id - 2
+            int index = cp.id - 2;
+            if (index < 0 || index >= caballosNPC.Length) continue;
+
+            HorseNPC npc = caballosNPC[index];
+            if (npc == null) continue;
+
+            // Posición lateral: el servidor da X de -7 a 7, escalamos al carril de Unity
+            float posX = cp.x * (npc.laneRight / 7f);
+            npc.SetLateralPosition(posX);
+
+            // Velocidad: la estimamos según el estado del servidor
+            float velocidadObjetivo = 0f;
+            switch (cp.estado)
             {
-                // Vamos a buscar la información del caballo ID 1 (Relámpago)
-                if (cp.id == 1 && caballoRelampago != null)
-                {
-                    // 1. TRADUCIR COORDENADAS:
-                    // En Python, X va de -7 a 7. Y es la altura del valle.
-                    // En Unity, podemos multiplicar X por 5 para que la pista sea más grande.
-                    float nuevaPosicionX = cp.x * 5f;
-                    float nuevaPosicionY = cp.y * 2f; // Multiplicamos para exagerar las colinas
-
-                    // Movemos suavemente al caballo a su nueva posición
-                    Vector3 posicionDestino = new Vector3(nuevaPosicionX, nuevaPosicionY, 0f);
-                    caballoRelampago.transform.position = Vector3.Lerp(caballoRelampago.transform.position, posicionDestino, Time.deltaTime * 10f);
-
-                    // 2. TRADUCIR ANIMACIÓN:
-                    // Si el estado es "Corriendo", le ponemos velocidad para que mueva las patas
-                    if (animRelampago != null)
-                    {
-                        if (cp.estado == "Corriendo")
-                        {
-                            animRelampago.SetFloat("State", 2f); // 2 era correr en tu Animator
-                        }
-                        else if (cp.estado == "Descansando" || cp.estado == "Lesionado")
-                        {
-                            animRelampago.SetFloat("State", 0f); // 0 es quieto
-                        }
-                    }
-                }
+                case "Corriendo":   velocidadObjetivo = npc.maxSpeed;         break;
+                case "Caminando":   velocidadObjetivo = npc.maxSpeed * 0.4f;  break;
+                case "Lesionado":   velocidadObjetivo = 0f;                   break;
+                case "Descansando": velocidadObjetivo = 0f;                   break;
+                default:            velocidadObjetivo = npc.maxSpeed * 0.5f;  break;
             }
+            npc.SetTargetSpeed(velocidadObjetivo);
         }
     }
 }
 
-// =========================================================================
-// CLASES PARA "TRADUCIR" EL JSON DE PYTHON A C#
-// Tienen que llamarse EXACTAMENTE igual que en tu código de Python (app.py)
-// =========================================================================
+// ── Clases de deserialización JSON (igual que el original) ────────────────
 
 [System.Serializable]
 public class DatosDelServidor
